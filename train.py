@@ -8,11 +8,15 @@ What this script does:
   1. Loads the pre-processed face images from old_model/processed_data/
   2. Splits them 80 / 10 / 10 (train / val / test), reproducible with seed 42
   3. Computes per-channel mean & std from the TRAINING split only (correct practice)
-  4. Applies strong data augmentation to the training split
-  5. Handles class imbalance with a WeightedRandomSampler
-  6. Trains EmotionNet with Adam + CosineAnnealingLR for up to 50 epochs
-  7. Saves the best checkpoint (highest val accuracy) to emotion_model.pth
-  8. Reports final test accuracy
+  4. Applies strong data augmentation to the training split, including:
+       - RandomGrayscale (10 %) to force structural learning over colour cues
+       - RandomErasing   (30 %) to simulate partial occlusion (hair, hands, etc.)
+  5. Applies Mixup augmentation in the training loop (blends pairs of images)
+  6. Handles class imbalance with a WeightedRandomSampler
+  7. Trains EmotionNet with Adam + LR warm-up (5 epochs) then CosineAnnealingLR,
+     with label smoothing and gradient clipping for stable training
+  8. Saves the best checkpoint (highest val accuracy) to emotion_model.pth
+  9. Reports final test accuracy + per-class F1 and confusion matrix
 
 Saved checkpoint format (emotion_model.pth):
   {
@@ -32,6 +36,7 @@ import os
 import sys
 from collections import Counter
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -56,6 +61,15 @@ LR = 1e-3
 WEIGHT_DECAY = 1e-4
 EARLY_STOP_PATIENCE = 10
 SEED = 42
+
+# Mixup augmentation: alpha controls the Beta distribution from which the
+# mixing coefficient λ is drawn.  alpha=0.2 concentrates mass near 0 and 1
+# (mostly single-class samples) with occasional strong mixes — a good balance.
+MIXUP_ALPHA = 0.2
+
+# Maximum gradient L2-norm before clipping.  Prevents rare large gradient
+# spikes (can occur with Mixup near λ=0.5) from destabilising training.
+GRAD_CLIP = 1.0
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -98,10 +112,15 @@ def compute_mean_std(subset: Subset, batch_size: int = 256):
 def make_transform(mean, std, augment: bool = False) -> transforms.Compose:
     """
     Training augmentation:
-      - Horizontal flip  (faces are symmetric)
-      - ±10° rotation    (natural head tilts)
-      - Colour jitter    (lighting variation between cameras / sessions)
-      - Small translate  (slight off-centre crops)
+      - Horizontal flip    (faces are symmetric)
+      - ±10° rotation      (natural head tilts)
+      - Colour jitter      (lighting variation between cameras / sessions)
+      - Small translate    (slight off-centre crops)
+      - RandomGrayscale    (forces model to rely on structural cues, not colour;
+                           real cameras are often near-greyscale under poor lighting)
+      - RandomErasing      (simulates partial occlusion — hair over eyes, hand in
+                           front of face — common in video calls; applied after
+                           ToTensor so it operates on normalised tensors)
     """
     ops = []
     if augment:
@@ -110,11 +129,21 @@ def make_transform(mean, std, augment: bool = False) -> transforms.Compose:
             transforms.RandomRotation(degrees=10),
             transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1, hue=0.05),
             transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
+            # Teach the model structure, not colour — 10% chance any sample goes grey
+            transforms.RandomGrayscale(p=0.10),
         ]
     ops += [
         transforms.ToTensor(),
         transforms.Normalize(mean, std),
     ]
+    if augment:
+        # RandomErasing must come AFTER normalisation (operates on tensors).
+        # scale: erase between 2% and 15% of the image area (small patches only).
+        # ratio: aspect ratios of the erased rectangle from 1:3 to 3:1.
+        # value=0 fills with zeros (mean-normalised black) — a neutral fill.
+        ops.append(
+            transforms.RandomErasing(p=0.30, scale=(0.02, 0.15), ratio=(0.3, 3.3), value=0)
+        )
     return transforms.Compose(ops)
 
 
@@ -130,6 +159,38 @@ def build_weighted_sampler(subset: Subset) -> WeightedRandomSampler:
     weights = [1.0 / counts[t] for t in targets]
     return WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
 
+# ── Mixup augmentation ─────────────────────────────────────────────────────────────────
+def mixup_data(
+    images: torch.Tensor,
+    labels: torch.Tensor,
+    alpha:  float = 0.2,
+):
+    """
+    Apply Mixup to a mini-batch.
+
+    Mixup (Zhang et al., 2018 — arxiv.org/abs/1710.09412) creates convex
+    combinations of training examples and their labels:
+
+        x_mixed = λ · x_i  +  (1−λ) · x_j
+        loss    = λ · CE(y_i) + (1−λ) · CE(y_j)
+
+    This is particularly useful for emotion recognition where label boundaries
+    are soft (a face can simultaneously show fear and surprise) — Mixup teaches
+    the model to produce smooth probability transitions rather than hard jumps.
+
+    Returns:
+        mixed    — interpolated images (same shape as input)
+        labels_a — original labels
+        labels_b — labels of the shuffled partner batch
+        lam      — the mixing coefficient λ ∈ (0, 1)
+    """
+    if alpha <= 0.0:
+        return images, labels, labels, 1.0
+    lam = float(np.random.beta(alpha, alpha))
+    batch_size = images.size(0)
+    idx = torch.randperm(batch_size, device=images.device)
+    mixed = lam * images + (1.0 - lam) * images[idx]
+    return mixed, labels, labels[idx], lam
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 def main() -> None:
@@ -196,15 +257,39 @@ def main() -> None:
     total_params = sum(p.numel() for p in model.parameters())
     print(f"EmotionNet parameters : {total_params:,}")
 
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
+
+    # ── Linear warm-up then cosine annealing ─────────────────────────────────
+    # Problem: starting at peak LR=1e-3 with Mixup active in epoch 1 creates
+    # noisy gradients that can push the model into a poor basin immediately.
+    # Solution: ramp LR from LR/5 → LR over the first WARMUP_EPOCHS epochs
+    # (LinearLR), then apply cosine decay as before (CosineAnnealingLR).
+    # SequentialLR glues them together: it runs the first scheduler for
+    # WARMUP_EPOCHS steps, then seamlessly hands off to the cosine scheduler.
+    WARMUP_EPOCHS = 5
+    warmup_scheduler = optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=0.2,        # epoch 1 LR = LR * 0.2 = 2e-4
+        end_factor=1.0,          # epoch WARMUP_EPOCHS LR = LR * 1.0 = 1e-3
+        total_iters=WARMUP_EPOCHS,
+    )
+    cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=EPOCHS - WARMUP_EPOCHS,
+        eta_min=1e-6,
+    )
+    scheduler = optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[WARMUP_EPOCHS],
+    )
 
     # ── 6. Training loop with early stopping ───────────────────────────────────
     best_val_acc = 0.0
     no_improve   = 0
 
-    header = f"{'Epoch':>5}  {'Train Loss':>10}  {'Val Acc':>8}  {'Best':>8}  {'LR':>10}"
+    header = f"{'Epoch':>5}  {'Train Loss':>10}  {'Train Acc':>9}  {'Val Acc':>8}  {'Best':>8}  {'LR':>10}"
     print("\n" + "=" * len(header))
     print(header)
     print("=" * len(header))
@@ -213,15 +298,30 @@ def main() -> None:
         # ── train ──
         model.train()
         running_loss = 0.0
+        correct_train = total_train_n = 0
         for imgs, labels in train_loader:
             imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
-            optimizer.zero_grad()
-            loss = criterion(model(imgs), labels)
-            loss.backward()
-            optimizer.step()
-            running_loss += loss.item()
 
-        avg_loss = running_loss / len(train_loader)
+            # Mixup: blend pairs of images; loss is a weighted sum of both CEs
+            mixed_imgs, labels_a, labels_b, lam = mixup_data(imgs, labels, MIXUP_ALPHA)
+
+            optimizer.zero_grad()
+            outputs = model(mixed_imgs)
+            loss = lam * criterion(outputs, labels_a) + (1.0 - lam) * criterion(outputs, labels_b)
+            loss.backward()
+            # Gradient clipping — prevents rare spikes near λ≈0.5 from destabilising training
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP)
+            optimizer.step()
+
+            running_loss += loss.item()
+            # Use the dominant-label side for the accuracy approximation
+            dominant_labels = labels_a if lam >= 0.5 else labels_b
+            preds_train = outputs.argmax(dim=1)
+            correct_train  += (preds_train == dominant_labels).sum().item()
+            total_train_n  += labels.size(0)
+
+        avg_loss  = running_loss / len(train_loader)
+        train_acc = correct_train / total_train_n * 100
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
 
@@ -257,7 +357,7 @@ def main() -> None:
             no_improve += 1
 
         print(
-            f"{epoch:>5}  {avg_loss:>10.4f}  {val_acc:>7.2f}%  "
+            f"{epoch:>5}  {avg_loss:>10.4f}  {train_acc:>8.2f}%  {val_acc:>7.2f}%  "
             f"{best_val_acc:>7.2f}%  {current_lr:>10.2e}{marker}"
         )
 
@@ -284,6 +384,49 @@ def main() -> None:
     test_acc = correct / total_t * 100
     print(f"Test accuracy     : {test_acc:.2f}%")
     print(f"{'=' * len(header)}\n")
+
+    # ── 8. Per-class evaluation (sklearn) ─────────────────────────────────────
+    # Inspired by the friend's notebook — crucial for a 7-class imbalanced
+    # dataset where per-class F1 reveals which emotions the model struggles with.
+    try:
+        from sklearn.metrics import (
+            classification_report,
+            confusion_matrix,
+            f1_score,
+        )
+
+        all_preds: list = []
+        all_labels: list = []
+        model.eval()
+        with torch.no_grad():
+            for imgs, labels in test_loader:
+                imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
+                preds = model(imgs).argmax(dim=1)
+                all_preds.extend(preds.cpu().tolist())
+                all_labels.extend(labels.cpu().tolist())
+
+        f1_macro    = f1_score(all_labels, all_preds, average="macro")
+        f1_weighted = f1_score(all_labels, all_preds, average="weighted")
+
+        print(f"F1 (macro)    : {f1_macro:.4f}")
+        print(f"F1 (weighted) : {f1_weighted:.4f}")
+        print()
+        print("Per-class report (test set):")
+        print(classification_report(all_labels, all_preds,
+                                    target_names=class_names, digits=3))
+
+        # Print confusion matrix with readable labels
+        cm = confusion_matrix(all_labels, all_preds)
+        col_header = "         " + "  ".join(f"{c[:5]:>5}" for c in class_names)
+        print("Confusion matrix  (rows = actual, cols = predicted):")
+        print(col_header)
+        for i, row in enumerate(cm):
+            print(f"  {class_names[i][:8]:<8}  " + "  ".join(f"{v:>5}" for v in row))
+        print()
+
+    except ImportError:
+        print("[metrics] scikit-learn not installed — skipping F1/confusion matrix.")
+        print("          Install with:  pip install scikit-learn")
 
 
 if __name__ == "__main__":

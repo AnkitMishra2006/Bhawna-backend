@@ -209,12 +209,21 @@ def _decode_frame(b64_data: str) -> Optional[np.ndarray]:
         return None
 
 
-def _detect_and_crop_face(frame: np.ndarray, pad: float = 0.15) -> Optional[np.ndarray]:
+def _detect_and_crop_face(
+    frame: np.ndarray, pad: float = 0.15
+) -> Tuple[Optional[np.ndarray], float]:
     """
     Detect the largest face in `frame` using MediaPipe, add padding around the
-    bounding box, crop it out, and return a 96×96 RGB numpy array.
+    bounding box, crop it out, and return a (96×96 RGB numpy array, score) tuple.
 
-    Returns None if no face is detected or if the crop is degenerate.
+    Returns (None, 0.0) if no face is detected or if the crop is degenerate.
+
+    The second element is MediaPipe's detection confidence in [0, 1].  High
+    confidence means the detector is certain a face is present; low confidence
+    (near the 0.5 threshold) means the detection is marginal — perhaps a small
+    face, heavy occlusion, or unusual angle.  The caller uses this score to
+    weight the frame's contribution to the smoothing window so that uncertain
+    frames influence the live chart less than high-quality detections.
 
     `pad` controls how much extra context to include around the tight bounding
     box as a fraction of the box size — 0.15 means 15 % extra on each side.
@@ -231,7 +240,7 @@ def _detect_and_crop_face(frame: np.ndarray, pad: float = 0.15) -> Optional[np.n
     with _MP_LOCK:
         results = FACE_DETECTOR.process(rgb)
     if not results.detections:
-        return None
+        return None, 0.0
 
     # Pick the detection with the largest bounding-box area
     best = max(
@@ -241,6 +250,9 @@ def _detect_and_crop_face(frame: np.ndarray, pad: float = 0.15) -> Optional[np.n
             * d.location_data.relative_bounding_box.height
         ),
     )
+
+    # MediaPipe detection score: probability that a face is present [0, 1]
+    det_score: float = float(best.score[0]) if best.score else 1.0
 
     bb   = best.location_data.relative_bounding_box
     bw   = bb.width
@@ -256,11 +268,46 @@ def _detect_and_crop_face(frame: np.ndarray, pad: float = 0.15) -> Optional[np.n
     x1 = min(w, x1);  y1 = min(h, y1)
 
     if x1 <= x0 or y1 <= y0:
-        return None
+        return None, 0.0
 
-    crop  = rgb[y0:y1, x0:x1]
-    crop  = cv2.resize(crop, (96, 96), interpolation=cv2.INTER_AREA)
-    return crop   # HWC uint8 RGB
+    crop = rgb[y0:y1, x0:x1]
+
+    # ── Face alignment: rotate so the eye line is horizontal ───────────────
+    # MediaPipe FaceDetection provides 6 keypoints per detection:
+    #   index 0 = right eye (person's right — appears on the LEFT of screen)
+    #   index 1 = left  eye (person's left  — appears on the RIGHT of screen)
+    # Training images were aligned (eyes roughly level).  Real webcam users
+    # tilt their heads, creating a train-inference distribution mismatch.
+    # We correct this by rotating the crop around the eye midpoint so the
+    # model always sees a level face, just as during training.
+    kps = best.location_data.relative_keypoints
+    if len(kps) >= 2:
+        # Convert normalised keypoints to pixel coords relative to the crop
+        re_x = kps[0].x * w - x0
+        re_y = kps[0].y * h - y0
+        le_x = kps[1].x * w - x0
+        le_y = kps[1].y * h - y0
+
+        dx = le_x - re_x
+        dy = le_y - re_y
+        if abs(dx) > 1.0:                         # avoid near-zero divide / noise
+            angle = float(np.degrees(np.arctan2(dy, dx)))
+            # Correct tilts > 2° but clamp at ±30° to ignore bad keypoints
+            if 2.0 < abs(angle) <= 30.0:
+                ch, cw = crop.shape[:2]
+                eye_cx = (re_x + le_x) / 2.0
+                eye_cy = (re_y + le_y) / 2.0
+                rot = cv2.getRotationMatrix2D(
+                    (float(eye_cx), float(eye_cy)), angle, 1.0
+                )
+                crop = cv2.warpAffine(
+                    crop, rot, (cw, ch),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_REPLICATE,
+                )
+
+    crop = cv2.resize(crop, (96, 96), interpolation=cv2.INTER_AREA)
+    return crop, det_score   # HWC uint8 RGB, detection confidence [0, 1]
 
 
 def _preprocess(face_rgb: np.ndarray) -> torch.Tensor:
@@ -284,18 +331,76 @@ def _run_model(tensor: torch.Tensor) -> Dict[str, float]:
     return {name: round(p * 100, 2) for name, p in zip(CLASS_NAMES, probs)}
 
 
-def _smooth_window(window: deque) -> Dict[str, float]:
+def _run_model_tta(face_rgb: np.ndarray) -> Dict[str, float]:
     """
-    Average emotion score dicts across the sliding window.
-    Returns a dict of {emotion: averaged_score} ready for the frontend chart.
+    Run the model with horizontal-flip Test-Time Augmentation (TTA).
+
+    Faces are roughly left-right symmetric for most emotions, so averaging
+    predictions over the original crop and its mirror reduces per-frame
+    variance and gives more stable probability estimates with no extra
+    latency budget: both crops are stacked into a single (2, C, H, W) batch
+    and processed in one forward pass.
+    """
+    t_orig = _preprocess(face_rgb)
+    t_flip = _preprocess(np.fliplr(face_rgb).copy())     # horizontal mirror
+    batch  = torch.cat([t_orig, t_flip], dim=0)          # (2, 3, 96, 96)
+    probs  = MODEL.predict_proba(batch)                  # (2, num_classes)
+    avg    = probs.mean(dim=0).cpu().tolist()             # (num_classes,)
+    return {name: round(p * 100, 2) for name, p in zip(CLASS_NAMES, avg)}
+
+
+def _smooth_window(
+    window: deque,
+    weights: deque,
+    ema_alpha: float = 0.3,
+) -> Dict[str, float]:
+    """
+    Compute smoothed emotion scores using an exponentially weighted moving average,
+    where each frame is additionally weighted by its detection confidence score.
+
+    Why EMA instead of a plain box average?
+    ----------------------------------------
+    A uniform 15-frame average gives equal weight to a frame from 3 seconds ago
+    and one from 50 ms ago.  For a live emotion display this feels sluggish —
+    the chart lags noticeably when the user's expression changes.  EMA fixes
+    this: recent frames carry exponentially more weight (controlled by alpha).
+    alpha=0.3 means the most recent 5–7 frames dominate while still providing
+    enough smoothing to hide single-frame flicker (blinks, micro-expressions).
+
+    Why multiply by detection confidence?
+    ----------------------------------------
+    MediaPipe returns a confidence in [0, 1] for every detection.  A score near
+    0.5 (the minimum threshold) means the detector is uncertain — perhaps the
+    face is tiny, heavily occluded, or at an extreme angle.  Those frames should
+    contribute less to the live chart than frames where the detector is confident
+    (score ≥ 0.9 = clear, well-lit, front-on face).  Multiplying each frame's
+    probabilities by its detection score before averaging achieves this naturally.
+
+    Implementation
+    ----------------------------------------
+    We iterate oldest → newest through the deque, applying the EMA accumulation
+    rule:  acc = alpha * (w_i * score_i) + (1 − alpha) * acc
+    where w_i is the raw score dict and score_i the detection confidence.
+    The final values are divided by the accumulated weight sum to keep the
+    output in [0, 100] regardless of the number of frames seen so far.
     """
     if not window:
         return {name: 0.0 for name in CLASS_NAMES}
-    n = len(window)
-    return {
-        name: round(sum(entry[name] for entry in window) / n, 2)
-        for name in CLASS_NAMES
-    }
+
+    acc      = {name: 0.0 for name in CLASS_NAMES}
+    acc_w    = 0.0
+    momentum = 1.0 - ema_alpha
+
+    for scores, w in zip(window, weights):          # oldest → newest
+        scaled_w = ema_alpha * w
+        for name in CLASS_NAMES:
+            acc[name] = scaled_w * scores[name] + momentum * acc[name]
+        acc_w = scaled_w + momentum * acc_w
+
+    if acc_w < 1e-9:
+        return {name: 0.0 for name in CLASS_NAMES}
+
+    return {name: round(acc[name] / acc_w, 2) for name in CLASS_NAMES}
 
 # ── Audio transcription ────────────────────────────────────────────────────────────
 
@@ -346,6 +451,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
     # Initialise per-session state
     SESSIONS[session_id] = {
         "window":       deque(maxlen=WINDOW_SIZE),   # raw scores — last 15 frames
+        "det_weights":  deque(maxlen=WINDOW_SIZE),   # MediaPipe detection confidence per frame
         "history":      [],                           # (timestamp, dominant, smoothed)
         "audio_chunks": [],                           # raw bytes from audio_chunk messages
         "start":        time.monotonic(),
@@ -433,16 +539,19 @@ def _process_frame_sync(msg: dict, session: dict) -> dict:
     if frame is None:
         return {"type": "result", "face_detected": False, "timestamp": timestamp}
 
-    face_crop = _detect_and_crop_face(frame)
+    face_crop, det_score = _detect_and_crop_face(frame)
     if face_crop is None:
         return {"type": "result", "face_detected": False, "timestamp": timestamp}
 
-    tensor     = _preprocess(face_crop)
-    raw_scores = _run_model(tensor)
+    raw_scores = _run_model_tta(face_crop)
 
-    # Advance the sliding window and compute smoothed scores
+    # Advance the sliding window and compute smoothed scores.
+    # The detection confidence gates how much this frame contributes: a clear
+    # front-on face (score ~0.95) counts almost fully; a marginal blurry
+    # detection (score ~0.55) counts roughly 60 % as much.
     session["window"].append(raw_scores)
-    smoothed_scores = _smooth_window(session["window"])
+    session["det_weights"].append(det_score)
+    smoothed_scores = _smooth_window(session["window"], session["det_weights"])
 
     dominant   = max(smoothed_scores, key=smoothed_scores.get)
     confidence = smoothed_scores[dominant]
