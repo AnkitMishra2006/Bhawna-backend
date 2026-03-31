@@ -192,6 +192,29 @@ class EmotionNet(nn.Module):
             nn.Linear(128, num_classes),
         )
 
+        # ── Proper weight initialisation (He et al., 2015) ──────────────────
+        # Every major CNN reference implementation (ResNet, EfficientNet,
+        # MobileNet) explicitly applies Kaiming Normal init for conv layers
+        # followed by ReLU.  PyTorch's default (Kaiming Uniform) is okay, but
+        # Normal with mode='fan_out' is the established best practice:
+        #   • fan_out preserves variance in the backward pass (better gradient
+        #     flow through deep networks)
+        #   • Normal distribution matches the theoretical derivation in the
+        #     He et al. paper more closely than Uniform
+        # BN layers: weight=1, bias=0 (already the default, but explicit is
+        # defensive against future PyTorch changes).
+        # Linear layers: Kaiming Normal is also correct for ReLU activations.
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Returns raw logits, shape (batch, num_classes)."""
         x = self.features(x)

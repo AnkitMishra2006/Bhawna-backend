@@ -52,7 +52,7 @@ sys.path.insert(0, HERE)
 from model import EmotionNet
 
 # ── Config ──────────────────────────────────────────────────────────────────
-DATA_DIR = os.path.join(HERE, "..", "old_model", "processed_data")
+DATA_DIR = os.path.join(HERE, "processed_data")
 SAVE_PATH = os.path.join(HERE, "emotion_model.pth")
 
 BATCH_SIZE = 64
@@ -258,7 +258,15 @@ def main() -> None:
     print(f"EmotionNet parameters : {total_params:,}")
 
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-    optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    # AdamW (Loshchilov & Hutter, 2019 — arxiv.org/abs/1711.05101) decouples
+    # weight decay from the gradient update.  Standard Adam's weight_decay is
+    # actually L2 regularisation added to the gradient, which interacts badly
+    # with the per-parameter adaptive learning rate — heavily updated params
+    # get less regularisation than rarely updated ones.  AdamW fixes this by
+    # applying weight decay directly to the parameters after the Adam step,
+    # ensuring every parameter is regularised equally regardless of its gradient
+    # history.  This is a one-line swap and is strictly better.
+    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 
     # ── Linear warm-up then cosine annealing ─────────────────────────────────
     # Problem: starting at peak LR=1e-3 with Mixup active in epoch 1 creates
