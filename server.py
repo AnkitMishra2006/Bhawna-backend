@@ -94,6 +94,9 @@ from model import EmotionNet
 # ── Load environment variables from optional .env file ──────────────────────
 load_dotenv(os.path.join(HERE, ".env"))
 
+# ── Authentication (Google OAuth + JWT + SQLite) ────────────────────────────
+from auth import auth_router, init_db, verify_token
+
 # ── Globals loaded once at startup ──────────────────────────────────────────
 DEVICE: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MODEL:  Optional[EmotionNet] = None
@@ -123,6 +126,9 @@ WINDOW_SIZE = 15
 async def lifespan(app: FastAPI):
     """Startup and shutdown logic for the FastAPI application."""
     global MODEL, MEAN, STD, CLASS_NAMES, FACE_DETECTOR, WHISPER_MODEL
+
+    # ── Initialise authentication database ────────────────────────────────────
+    init_db()
 
     # ── Load trained emotion model ────────────────────────────────────────────
     model_path = os.path.join(HERE, "emotion_model.pth")
@@ -188,6 +194,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(auth_router)
 
 
 # ── Frame processing helpers ─────────────────────────────────────────────────
@@ -446,6 +454,18 @@ def _transcribe_audio(audio_chunks: List[bytes]) -> Optional[str]:
 
 @app.websocket("/ws/{session_id}")
 async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
+    # ── Authenticate via query-string token ────────────────────────────────
+    token = websocket.query_params.get("token")
+    user_payload = verify_token(token) if token else None
+    if not user_payload:
+        await websocket.accept()
+        await websocket.send_text(json.dumps({
+            "type": "auth_error",
+            "message": "Authentication required. Please log in first.",
+        }))
+        await websocket.close(code=4001)
+        return
+
     await websocket.accept()
 
     # Initialise per-session state
