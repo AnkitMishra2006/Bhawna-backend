@@ -5,8 +5,14 @@ Run from inside the backend/ folder:
     python train.py
 
 What this script does:
-  1. Loads the pre-processed face images from old_model/processed_data/
-  2. Splits them 80 / 10 / 10 (train / val / test), reproducible with seed 42
+  1. Loads face images from three sources into a single combined dataset:
+       • processed_data/  — pre-processed FER images   (96×96,   ~49 K images)
+       • archive/          — RAF-DB aligned images       (100×100, ~15 K images,
+                             automatically resized to 96×96 in the transform)
+       • Affectnet/        — AffectNet in-the-wild images (96×96,  ~28 K images;
+                             the 8th class 'contempt' is silently skipped since
+                             our model targets the standard 7-emotion set)
+  2. Splits the combined ~93 K images 80 / 10 / 10 (train / val / test), reproducible with seed 42
   3. Computes per-channel mean & std from the TRAINING split only (correct practice)
   4. Applies strong data augmentation to the training split, including:
        - RandomGrayscale (10 %) to force structural learning over colour cues
@@ -40,7 +46,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset, Subset, WeightedRandomSampler
 from torchvision import datasets, transforms
 
 # ---------------------------------------------------------------------------
@@ -52,8 +59,10 @@ sys.path.insert(0, HERE)
 from model import EmotionNet
 
 # ── Config ──────────────────────────────────────────────────────────────────
-DATA_DIR = os.path.join(HERE, "processed_data")
-SAVE_PATH = os.path.join(HERE, "emotion_model.pth")
+DATA_DIR      = os.path.join(HERE, "processed_data")
+RAFDB_DIR     = os.path.join(HERE, "archive")      # RAF-DB archive/ folder
+AFFECTNET_DIR = os.path.join(HERE, "Affectnet")   # AffectNet folder (Train/ + Test/)
+SAVE_PATH     = os.path.join(HERE, "emotion_model.pth")
 
 BATCH_SIZE = 64
 EPOCHS = 50
@@ -122,7 +131,11 @@ def make_transform(mean, std, augment: bool = False) -> transforms.Compose:
                            front of face — common in video calls; applied after
                            ToTensor so it operates on normalised tensors)
     """
-    ops = []
+    ops = [
+        # Resize to 96×96 so RAF-DB (100×100) and processed_data (96×96)
+        # are always the same size going into the model.
+        transforms.Resize((96, 96)),
+    ]
     if augment:
         ops += [
             transforms.RandomHorizontalFlip(p=0.5),
@@ -158,6 +171,128 @@ def build_weighted_sampler(subset: Subset) -> WeightedRandomSampler:
     counts = Counter(targets)
     weights = [1.0 / counts[t] for t in targets]
     return WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+
+# ── Combined FER + RAF-DB dataset ────────────────────────────────────────────
+class CombinedFERDataset(Dataset):
+    """
+    Merges three FER sources into a single Dataset:
+
+      1. processed_data/  — pre-processed FER images organised by emotion folder
+      2. archive/DATASET/ — RAF-DB aligned images in numbered sub-folders (1-7)
+             1=Surprise  2=Fear  3=Disgust  4=Happy  5=Sad  6=Angry  7=Neutral
+      3. Affectnet/       — AffectNet Train/ and Test/ splits organised by emotion
+             folder name 'anger' maps to class 'angry';
+             folder 'contempt' is silently skipped (not in our 7-class set);
+             folder names are matched case-insensitively so 'Anger' == 'anger'.
+
+    All images are resized to 96×96 inside the transform pipeline (AffectNet
+    images are already 96×96, so the resize is a no-op for them).
+    """
+
+    # RAF-DB integer folder name → emotion string matching processed_data/ class names
+    RAFDB_FOLDER_TO_EMOTION: dict = {
+        "1": "surprise",
+        "2": "fear",
+        "3": "disgust",
+        "4": "happy",
+        "5": "sad",
+        "6": "angry",
+        "7": "neutral",
+    }
+
+    # AffectNet folder name (lowercase) → emotion string.
+    # 'contempt' is intentionally absent — it's the 8th class we don't model.
+    # Matching is done case-insensitively so 'Anger' and 'anger' both resolve.
+    AFFECTNET_FOLDER_TO_EMOTION: dict = {
+        "anger":    "angry",
+        "disgust":  "disgust",
+        "fear":     "fear",
+        "happy":    "happy",
+        "neutral":  "neutral",
+        "sad":      "sad",
+        "surprise": "surprise",
+        # "contempt" → omitted, will be skipped automatically
+    }
+
+    def __init__(
+        self,
+        samples: list,
+        classes: list,
+        class_to_idx: dict,
+        transform=None,
+    ) -> None:
+        self.samples      = samples        # list of (path: str, label: int)
+        self.classes      = classes
+        self.class_to_idx = class_to_idx
+        self.targets      = [s[1] for s in samples]  # needed by WeightedRandomSampler
+        self.transform    = transform
+
+    # ── Factory ──────────────────────────────────────────────────────────────
+    @classmethod
+    def build(
+        cls,
+        fer_dir: str,
+        rafdb_dir: str,
+        affectnet_dir: str,
+        transform=None,
+    ) -> "CombinedFERDataset":
+        """
+        Scan all three source directories and return a ready-to-use dataset.
+        Missing directories are silently skipped so the script still works if
+        only a subset of the datasets is present.
+        """
+        # Use ImageFolder on processed_data to determine canonical class ordering.
+        tmp           = datasets.ImageFolder(fer_dir)
+        classes       = tmp.classes        # alphabetically sorted: angry,disgust,...
+        class_to_idx  = tmp.class_to_idx
+
+        samples: list = list(tmp.samples)  # (path, label_idx) from processed_data
+
+        # ── RAF-DB (numbered sub-folders) ─────────────────────────────────────
+        for split in ("train", "test"):
+            for folder_num, emotion in cls.RAFDB_FOLDER_TO_EMOTION.items():
+                folder_path = os.path.join(rafdb_dir, "DATASET", split, folder_num)
+                if not os.path.isdir(folder_path):
+                    continue
+                label_idx = class_to_idx[emotion]
+                for fname in sorted(os.listdir(folder_path)):
+                    if fname.lower().endswith((".jpg", ".jpeg", ".png")):
+                        samples.append((os.path.join(folder_path, fname), label_idx))
+
+        # ── AffectNet (Train/ and Test/ splits, skip contempt) ────────────────
+        for split in ("Train", "Test"):
+            split_dir = os.path.join(affectnet_dir, split)
+            if not os.path.isdir(split_dir):
+                continue
+            for folder_name in sorted(os.listdir(split_dir)):
+                # Case-insensitive lookup handles 'anger' (Train) vs 'Anger' (Test)
+                emotion = cls.AFFECTNET_FOLDER_TO_EMOTION.get(folder_name.lower())
+                if emotion is None:
+                    # Unknown or skipped class (e.g. contempt) — ignore silently
+                    continue
+                label_idx   = class_to_idx[emotion]
+                folder_path = os.path.join(split_dir, folder_name)
+                for fname in sorted(os.listdir(folder_path)):
+                    if fname.lower().endswith((".jpg", ".jpeg", ".png")):
+                        samples.append((os.path.join(folder_path, fname), label_idx))
+
+        return cls(samples, classes, class_to_idx, transform)
+
+    def with_transform(self, transform) -> "CombinedFERDataset":
+        """Return a new instance sharing the same samples but with a different transform."""
+        return CombinedFERDataset(self.samples, self.classes, self.class_to_idx, transform)
+
+    # ── Dataset protocol ─────────────────────────────────────────────────────
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int):
+        path, label = self.samples[idx]
+        img = Image.open(path).convert("RGB")
+        if self.transform:
+            img = self.transform(img)
+        return img, label
+
 
 # ── Mixup augmentation ─────────────────────────────────────────────────────────────────
 def mixup_data(
@@ -195,21 +330,30 @@ def mixup_data(
 # ── Main ─────────────────────────────────────────────────────────────────────
 def main() -> None:
     set_seed(SEED)
-    print(f"Device  : {DEVICE}")
-    print(f"Data    : {os.path.abspath(DATA_DIR)}")
-    print(f"Save to : {SAVE_PATH}\n")
+    print(f"Device     : {DEVICE}")
+    print(f"FER data   : {os.path.abspath(DATA_DIR)}")
+    print(f"RAF-DB     : {os.path.abspath(RAFDB_DIR)}")
+    print(f"AffectNet  : {os.path.abspath(AFFECTNET_DIR)}")
+    print(f"Save to    : {SAVE_PATH}\n")
 
-    # ── 1. Load dataset with a minimal transform to compute stats ─────────────
-    raw_ds = datasets.ImageFolder(DATA_DIR, transform=transforms.ToTensor())
+    # ── 1. Load combined dataset (processed_data + RAF-DB + AffectNet) ────────
+    raw_ds = CombinedFERDataset.build(
+        DATA_DIR, RAFDB_DIR, AFFECTNET_DIR,
+        transform=transforms.Compose([
+            transforms.Resize((96, 96)),
+            transforms.ToTensor(),
+        ]),
+    )
     class_names: list = raw_ds.classes
-    num_classes: int = len(class_names)
-    total: int = len(raw_ds)
+    num_classes: int  = len(class_names)
+    total: int        = len(raw_ds)
 
     print(f"Classes ({num_classes}) : {class_names}")
     print(f"Total images       : {total:,}")
 
     dist = Counter(raw_ds.targets)
-    for cls, idx in raw_ds.class_to_idx.items():
+    for cls in class_names:
+        idx = raw_ds.class_to_idx[cls]
         print(f"  {cls:<10} : {dist[idx]:,}")
 
     # ── 2. Deterministic split ─────────────────────────────────────────────────
@@ -235,7 +379,7 @@ def main() -> None:
 
     # ── 4. Build final split datasets with correct transforms ─────────────────
     def make_subset(augment: bool, indices: list) -> Subset:
-        ds = datasets.ImageFolder(DATA_DIR, transform=make_transform(mean, std, augment=augment))
+        ds = raw_ds.with_transform(make_transform(mean, std, augment=augment))
         return Subset(ds, indices)
 
     train_ds = make_subset(augment=True,  indices=train_idx)

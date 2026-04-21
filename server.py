@@ -80,10 +80,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import mediapipe as mp
+from mediapipe.tasks import python as _mp_python
+from mediapipe.tasks.python import vision as _mp_vision
 import numpy as np
 import torch
+from bson import ObjectId
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 # ── Make sure model.py is importable when the working directory is not backend/
@@ -95,7 +98,7 @@ from model import EmotionNet
 load_dotenv(os.path.join(HERE, ".env"))
 
 # ── Authentication (Google OAuth + JWT + MongoDB) ───────────────────────────
-from auth import auth_router, get_user_from_token, init_db
+from auth import auth_router, get_analysis_collection, get_user_from_token, init_db
 
 # ── Globals loaded once at startup ──────────────────────────────────────────
 DEVICE: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -105,13 +108,14 @@ STD:    List[float] = [0.5, 0.5, 0.5]
 CLASS_NAMES: List[str] = ["angry", "disgust", "fear", "happy", "neutral", "sad", "surprise"]
 
 # MediaPipe face detector — initialised once, reused across all sessions.
-# IMPORTANT: FaceDetection.process() is NOT thread-safe.  All calls are
-# serialised through _MP_LOCK so concurrent WebSocket sessions don't race.
-FACE_DETECTOR: Optional[mp.solutions.face_detection.FaceDetection] = None
+# IMPORTANT: FaceDetector.detect() is serialised through _MP_LOCK so
+# concurrent WebSocket sessions don't race on shared internal state.
+FACE_DETECTOR: Optional[Any] = None
 _MP_LOCK = threading.Lock()
 
 # Whisper speech-to-text — loaded at startup if openai-whisper is installed.
 WHISPER_MODEL: Optional[Any] = None
+ANALYSIS_COLLECTION: Optional[Any] = None
 
 # ── Per-session state ────────────────────────────────────────────────────────
 # key = session_id (string from the URL path)
@@ -120,15 +124,118 @@ SESSIONS: Dict[str, dict] = {}
 # The sliding window size (15 frames ≈ 3 s at 5 fps) as used by the project spec
 WINDOW_SIZE = 15
 
+DEFAULT_REPORT_CONTEXT_KEY = "general"
+REPORT_CONTEXT_PRESETS: Dict[str, Dict[str, str]] = {
+    "general": {
+        "label": "General emotional snapshot",
+        "focus_prompt": "Provide a balanced reading of emotional flow, transitions, and stability.",
+        "template_hint": "Use a broad and neutral interpretation of the emotional timeline.",
+        "default_objective": "Understand the overall emotional trajectory and key shifts.",
+        "safety_note": "Keep the interpretation observational and non-judgmental.",
+    },
+    "candidate_interview": {
+        "label": "Candidate interview review",
+        "focus_prompt": "Prioritise confidence, stress regulation, recovery after hard questions, and communication composure.",
+        "template_hint": "Frame insights as interview-readiness signals and coaching opportunities.",
+        "default_objective": "Assess interview confidence and pressure handling.",
+        "safety_note": "Avoid hiring recommendations; focus on behavioral observation.",
+    },
+    "education": {
+        "label": "Teaching and learning",
+        "focus_prompt": "Focus on engagement rhythm, confusion windows, and signs of sustained attention.",
+        "template_hint": "Highlight moments that may correspond to comprehension or cognitive overload.",
+        "default_objective": "Measure engagement and identify confusing moments.",
+        "safety_note": "Do not infer intelligence or capability from expressions.",
+    },
+    "customer_support": {
+        "label": "Customer support QA",
+        "focus_prompt": "Analyse empathy signals, calmness under friction, and de-escalation consistency.",
+        "template_hint": "Frame feedback around service quality and emotional resilience.",
+        "default_objective": "Evaluate empathy and emotional control during difficult interactions.",
+        "safety_note": "Avoid personal judgments and stick to observable patterns.",
+    },
+    "sales_pitch": {
+        "label": "Sales or persuasion",
+        "focus_prompt": "Assess conviction, emotional energy, trust-building windows, and momentum drop-offs.",
+        "template_hint": "Interpret shifts in emotional intensity as persuasion-strength clues.",
+        "default_objective": "Improve persuasive confidence and trust-building moments.",
+        "safety_note": "Do not claim conversion outcomes from emotion data alone.",
+    },
+    "public_speaking": {
+        "label": "Public speaking coaching",
+        "focus_prompt": "Map stage confidence arc, anxiety regulation, and audience-facing presence.",
+        "template_hint": "Translate emotional transitions into speaking-coaching cues.",
+        "default_objective": "Coach confidence and steady stage presence.",
+        "safety_note": "Keep guidance constructive and non-clinical.",
+    },
+    "content_creation": {
+        "label": "Creator performance",
+        "focus_prompt": "Evaluate camera authenticity, emotional pacing, and perceived engagement pull.",
+        "template_hint": "Connect the timeline to creator presence and likely audience resonance.",
+        "default_objective": "Improve camera presence and emotional pacing.",
+        "safety_note": "Avoid claims about audience metrics without supporting data.",
+    },
+    "ux_research": {
+        "label": "UX research session",
+        "focus_prompt": "Emphasise friction signals, confusion clusters, and delight windows tied to interaction flow.",
+        "template_hint": "Present emotion changes as product-experience evidence.",
+        "default_objective": "Identify UX friction points and positive interaction moments.",
+        "safety_note": "Treat this as directional evidence, not conclusive usability proof.",
+    },
+    "therapy_coaching": {
+        "label": "Wellbeing coaching",
+        "focus_prompt": "Offer reflective emotional insights in supportive language while avoiding diagnosis.",
+        "template_hint": "Focus on self-awareness and practical emotional regulation reflection.",
+        "default_objective": "Support reflective self-awareness in a non-clinical context.",
+        "safety_note": "Never provide clinical diagnosis or treatment advice.",
+    },
+    "medical_observation": {
+        "label": "Clinical observation",
+        "focus_prompt": "Produce a structured observational summary suitable for clinician review.",
+        "template_hint": "Use clear observational language and avoid diagnostic conclusions.",
+        "default_objective": "Create structured observational notes for clinical review.",
+        "safety_note": "This output is observational only and is not a diagnosis.",
+    },
+}
+
+
+def _normalise_report_context(raw_context: Any) -> Dict[str, str]:
+    """Coerce arbitrary client payload into a safe, known report context shape."""
+    payload = raw_context if isinstance(raw_context, dict) else {}
+
+    requested_key = str(payload.get("key", "")).strip().lower()
+    key = requested_key if requested_key in REPORT_CONTEXT_PRESETS else DEFAULT_REPORT_CONTEXT_KEY
+    preset = REPORT_CONTEXT_PRESETS[key]
+
+    label = str(payload.get("label") or preset["label"]).strip() or preset["label"]
+    objective = str(payload.get("objective") or "").strip() or preset["default_objective"]
+    extra_notes = str(payload.get("extra_notes") or "").strip()
+
+    return {
+        "key": key,
+        "label": label,
+        "objective": objective,
+        "extra_notes": extra_notes,
+        "focus_prompt": preset["focus_prompt"],
+        "template_hint": preset["template_hint"],
+        "safety_note": preset["safety_note"],
+    }
+
 
 # ── Lifespan (replaces deprecated @app.on_event) ─────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown logic for the FastAPI application."""
-    global MODEL, MEAN, STD, CLASS_NAMES, FACE_DETECTOR, WHISPER_MODEL
+    global MODEL, MEAN, STD, CLASS_NAMES, FACE_DETECTOR, WHISPER_MODEL, ANALYSIS_COLLECTION
 
     # ── Initialise authentication database ────────────────────────────────────
     init_db()
+    try:
+        ANALYSIS_COLLECTION = get_analysis_collection()
+        print("[startup] Analysis collection ready.")
+    except Exception as exc:
+        ANALYSIS_COLLECTION = None
+        print(f"[startup] WARNING: analysis collection unavailable ({exc})")
 
     # ── Load trained emotion model ────────────────────────────────────────────
     model_path = os.path.join(HERE, "emotion_model.pth")
@@ -154,10 +261,21 @@ async def lifespan(app: FastAPI):
             "          Run  python train.py  inside the backend/ folder first."
         )
 
-    # ── Initialise MediaPipe face detector ────────────────────────────────────
-    FACE_DETECTOR = mp.solutions.face_detection.FaceDetection(
-        model_selection=1,               # model 1: optimised for full-range (0–5 m)
-        min_detection_confidence=0.5,
+    # ── Initialise MediaPipe face detector (Tasks API — mediapipe 0.10+) ────────
+    face_model_path = os.path.join(HERE, "blaze_face_short_range.tflite")
+    if not os.path.exists(face_model_path):
+        import urllib.request
+        print("[startup] Downloading MediaPipe face model (~1 MB)...")
+        urllib.request.urlretrieve(
+            "https://storage.googleapis.com/mediapipe-models/face_detector/"
+            "blaze_face_short_range/float16/latest/blaze_face_short_range.tflite",
+            face_model_path,
+        )
+    FACE_DETECTOR = _mp_vision.FaceDetector.create_from_options(
+        _mp_vision.FaceDetectorOptions(
+            base_options=_mp_python.BaseOptions(model_asset_path=face_model_path),
+            min_detection_confidence=0.5,
+        )
     )
     print("[startup] MediaPipe face detector ready.")
 
@@ -219,7 +337,7 @@ def _decode_frame(b64_data: str) -> Optional[np.ndarray]:
 
 def _detect_and_crop_face(
     frame: np.ndarray, pad: float = 0.15
-) -> Tuple[Optional[np.ndarray], float]:
+) -> Tuple[Optional[np.ndarray], float, Optional[Dict[str, float]]]:
     """
     Detect the largest face in `frame` using MediaPipe, add padding around the
     bounding box, crop it out, and return a (96×96 RGB numpy array, score) tuple.
@@ -245,38 +363,45 @@ def _detect_and_crop_face(
     h, w = frame.shape[:2]
     rgb  = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
+    mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
     with _MP_LOCK:
-        results = FACE_DETECTOR.process(rgb)
+        results = FACE_DETECTOR.detect(mp_img)
     if not results.detections:
-        return None, 0.0
+        return None, 0.0, None
 
-    # Pick the detection with the largest bounding-box area
+    # Pick the detection with the largest bounding-box area (pixel coordinates)
     best = max(
         results.detections,
-        key=lambda d: (
-            d.location_data.relative_bounding_box.width
-            * d.location_data.relative_bounding_box.height
-        ),
+        key=lambda d: d.bounding_box.width * d.bounding_box.height,
     )
 
     # MediaPipe detection score: probability that a face is present [0, 1]
-    det_score: float = float(best.score[0]) if best.score else 1.0
+    det_score: float = float(best.categories[0].score) if best.categories else 1.0
 
-    bb   = best.location_data.relative_bounding_box
-    bw   = bb.width
-    bh   = bb.height
+    bb = best.bounding_box   # pixel coords: origin_x, origin_y, width, height
+    bw = bb.width
+    bh = bb.height
 
-    x0 = int((bb.xmin - pad * bw) * w)
-    y0 = int((bb.ymin - pad * bh) * h)
-    x1 = int((bb.xmin + (1.0 + pad) * bw) * w)
-    y1 = int((bb.ymin + (1.0 + pad) * bh) * h)
+    x0 = int(bb.origin_x - pad * bw)
+    y0 = int(bb.origin_y - pad * bh)
+    x1 = int(bb.origin_x + (1.0 + pad) * bw)
+    y1 = int(bb.origin_y + (1.0 + pad) * bh)
 
     # Clamp to frame bounds
     x0 = max(0, x0);  y0 = max(0, y0)
     x1 = min(w, x1);  y1 = min(h, y1)
 
     if x1 <= x0 or y1 <= y0:
-        return None, 0.0
+        return None, 0.0, None
+
+    box_w = x1 - x0
+    box_h = y1 - y0
+    face_box = {
+        "x": round(x0 / max(w, 1), 6),
+        "y": round(y0 / max(h, 1), 6),
+        "width": round(box_w / max(w, 1), 6),
+        "height": round(box_h / max(h, 1), 6),
+    }
 
     crop = rgb[y0:y1, x0:x1]
 
@@ -288,7 +413,7 @@ def _detect_and_crop_face(
     # tilt their heads, creating a train-inference distribution mismatch.
     # We correct this by rotating the crop around the eye midpoint so the
     # model always sees a level face, just as during training.
-    kps = best.location_data.relative_keypoints
+    kps = best.keypoints   # NormalizedKeypoint: .x and .y in [0, 1]
     if len(kps) >= 2:
         # Convert normalised keypoints to pixel coords relative to the crop
         re_x = kps[0].x * w - x0
@@ -315,7 +440,7 @@ def _detect_and_crop_face(
                 )
 
     crop = cv2.resize(crop, (96, 96), interpolation=cv2.INTER_AREA)
-    return crop, det_score   # HWC uint8 RGB, detection confidence [0, 1]
+    return crop, det_score, face_box   # HWC uint8 RGB, detection confidence [0, 1]
 
 
 def _preprocess(face_rgb: np.ndarray) -> torch.Tensor:
@@ -450,6 +575,107 @@ def _transcribe_audio(audio_chunks: List[bytes]) -> Optional[str]:
             except OSError:
                 pass
 
+
+def _emotion_distribution_from_history(history: List[Tuple]) -> Dict[str, float]:
+    """Convert dominant-emotion counts to percentages for report summaries."""
+    if not history:
+        return {name: 0.0 for name in CLASS_NAMES}
+
+    counts = {name: 0 for name in CLASS_NAMES}
+    for _, dominant, _ in history:
+        counts[dominant] += 1
+
+    total = len(history)
+    return {name: round(count / total * 100, 2) for name, count in counts.items()}
+
+
+def _serialise_analysis_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert Mongo document fields into JSON-safe response payload."""
+    return {
+        "id": str(doc.get("_id")),
+        "session_id": doc.get("session_id"),
+        "backend": doc.get("backend"),
+        "user": {
+            "id": doc.get("user_id"),
+            "email": doc.get("user_email"),
+            "name": doc.get("user_name"),
+        },
+        "created_at": doc.get("created_at"),
+        "ended_at": doc.get("ended_at"),
+        "duration_seconds": doc.get("duration_seconds", 0.0),
+        "total_frames": doc.get("total_frames", 0),
+        "detected_frames": doc.get("detected_frames", 0),
+        "face_detection_rate": doc.get("face_detection_rate", 0.0),
+        "emotion_distribution": doc.get("emotion_distribution", {}),
+        "timeline": doc.get("timeline", []),
+        "transcript": doc.get("transcript"),
+        "report_text": doc.get("report_text", ""),
+        "report_context": doc.get("report_context"),
+    }
+
+
+def _extract_user_from_request(request: Request) -> Optional[Dict[str, Any]]:
+    """Parse bearer token and return authenticated user payload."""
+    auth_header = request.headers.get("authorization", "")
+    if not auth_header.lower().startswith("bearer "):
+        return None
+    token = auth_header.split(" ", 1)[1].strip()
+    if not token:
+        return None
+    return get_user_from_token(token)
+
+
+def _persist_analysis_sync(
+    session_id: str,
+    session: Dict[str, Any],
+    user: Dict[str, Any],
+    transcript: Optional[str],
+    report_text: str,
+) -> Optional[str]:
+    """Write completed session metrics/report to MongoDB; returns inserted id."""
+    if ANALYSIS_COLLECTION is None:
+        return None
+
+    history: List[Tuple] = session.get("history", [])
+    frame_events: List[Dict[str, Any]] = session.get("frame_events", [])
+
+    if history:
+        duration = max(0.0, float(history[-1][0]) - float(history[0][0]))
+    elif frame_events:
+        duration = max(0.0, float(frame_events[-1].get("timestamp", 0.0)))
+    else:
+        duration = 0.0
+
+    detected_frames = len(history)
+    total_frames = len(frame_events)
+    detection_rate = round((detected_frames / total_frames) * 100, 2) if total_frames else 0.0
+
+    doc = {
+        "session_id": session_id,
+        "backend": "custom",
+        "user_id": user.get("id"),
+        "user_email": user.get("email"),
+        "user_name": user.get("name"),
+        "created_at": float(session.get("created_at", time.time())),
+        "ended_at": time.time(),
+        "duration_seconds": round(duration, 3),
+        "total_frames": total_frames,
+        "detected_frames": detected_frames,
+        "face_detection_rate": detection_rate,
+        "emotion_distribution": _emotion_distribution_from_history(history),
+        "timeline": frame_events,
+        "transcript": transcript,
+        "report_text": report_text,
+        "report_context": session.get("report_context"),
+    }
+
+    try:
+        result = ANALYSIS_COLLECTION.insert_one(doc)
+        return str(result.inserted_id)
+    except Exception as exc:
+        print(f"[db] Failed to persist analysis for {session_id}: {exc}")
+        return None
+
 # ── WebSocket endpoint ────────────────────────────────────────────────────────
 
 @app.websocket("/ws/{session_id}")
@@ -473,8 +699,13 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
         "window":       deque(maxlen=WINDOW_SIZE),   # raw scores — last 15 frames
         "det_weights":  deque(maxlen=WINDOW_SIZE),   # MediaPipe detection confidence per frame
         "history":      [],                           # (timestamp, dominant, smoothed)
+        "frame_events": [],                           # full frame timeline for DB report
         "audio_chunks": [],                           # raw bytes from audio_chunk messages
         "start":        time.monotonic(),
+        "created_at":   time.time(),
+        "backend":      "custom",
+        "report_context": _normalise_report_context(None),
+        "user":         user,
     }
     session = SESSIONS[session_id]
     loop    = asyncio.get_running_loop()
@@ -511,17 +742,55 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
                         pass   # silently discard corrupt chunks
 
             elif msg_type == "end":
+                session["report_context"] = _normalise_report_context(
+                    msg.get("report_context")
+                )
+                audio_chunks: List[bytes] = session["audio_chunks"]
+                chunk_count = len(audio_chunks)
+                chunk_bytes = sum(len(chunk) for chunk in audio_chunks)
+                print(
+                    f"[{session_id}] Audio chunks received: {chunk_count}, "
+                    f"total bytes: {chunk_bytes}"
+                )
                 # Transcribe audio in a thread (Whisper is CPU-heavy and sync)
                 transcript: Optional[str] = await loop.run_in_executor(
-                    None, _transcribe_audio, session["audio_chunks"]
+                    None, _transcribe_audio, audio_chunks
                 )
                 if transcript:
                     print(f"[{session_id}] Transcript ({len(transcript)} chars): "
-                          f"{transcript[:80]}{'\u2026' if len(transcript) > 80 else ''}")
+                          f"{transcript[:80]}{'...' if len(transcript) > 80 else ''}")
+                else:
+                    print(
+                        f"[{session_id}] Transcript unavailable "
+                        f"(whisper_loaded={WHISPER_MODEL is not None}, "
+                        f"audio_chunks={chunk_count})"
+                    )
 
-                report_text = await _generate_report(session, transcript)
+                report_text = await _generate_report(
+                    session,
+                    transcript,
+                    session.get("report_context"),
+                )
+                analysis_id: Optional[str] = await loop.run_in_executor(
+                    None,
+                    _persist_analysis_sync,
+                    session_id,
+                    session,
+                    user,
+                    transcript,
+                    report_text,
+                )
                 await websocket.send_text(
-                    json.dumps({"type": "report", "text": report_text})
+                    json.dumps(
+                        {
+                            "type": "report",
+                            "text": report_text,
+                            "analysis_id": analysis_id,
+                            "session_id": session_id,
+                            "backend": "custom",
+                            "report_context": session.get("report_context"),
+                        }
+                    )
                 )
                 break   # close normally after sending the report
 
@@ -547,6 +816,7 @@ def _process_frame_sync(msg: dict, session: dict) -> dict:
         → normalise → EmotionNet → softmax scores → sliding-window smooth
     """
     timestamp: float = float(msg.get("timestamp", 0.0))
+    frame_index = len(session.get("frame_events", []))
 
     if MODEL is None:
         return {
@@ -557,10 +827,24 @@ def _process_frame_sync(msg: dict, session: dict) -> dict:
 
     frame = _decode_frame(msg.get("data", ""))
     if frame is None:
+        session["frame_events"].append(
+            {
+                "frame_index": frame_index,
+                "timestamp": timestamp,
+                "face_detected": False,
+            }
+        )
         return {"type": "result", "face_detected": False, "timestamp": timestamp}
 
-    face_crop, det_score = _detect_and_crop_face(frame)
+    face_crop, det_score, face_box = _detect_and_crop_face(frame)
     if face_crop is None:
+        session["frame_events"].append(
+            {
+                "frame_index": frame_index,
+                "timestamp": timestamp,
+                "face_detected": False,
+            }
+        )
         return {"type": "result", "face_detected": False, "timestamp": timestamp}
 
     raw_scores = _run_model_tta(face_crop)
@@ -578,6 +862,19 @@ def _process_frame_sync(msg: dict, session: dict) -> dict:
 
     # Record for end-of-session report
     session["history"].append((timestamp, dominant, dict(smoothed_scores)))
+    session["frame_events"].append(
+        {
+            "frame_index": frame_index,
+            "timestamp": timestamp,
+            "face_detected": True,
+            "dominant_emotion": dominant,
+            "confidence": confidence,
+            "raw_scores": raw_scores,
+            "smoothed_scores": smoothed_scores,
+            "face_box": face_box,
+            "detection_confidence": round(det_score, 4),
+        }
+    )
 
     return {
         "type":             "result",
@@ -586,6 +883,7 @@ def _process_frame_sync(msg: dict, session: dict) -> dict:
         "smoothed_scores":  smoothed_scores,
         "dominant_emotion": dominant,
         "confidence":       confidence,
+        "face_box":         face_box,
         "timestamp":        timestamp,
     }
 
@@ -593,7 +891,8 @@ def _process_frame_sync(msg: dict, session: dict) -> dict:
 # ── Report generation ─────────────────────────────────────────────────────────
 
 async def _generate_report(session: dict,
-                           transcript: Optional[str] = None) -> str:
+                           transcript: Optional[str] = None,
+                           report_context: Optional[Dict[str, str]] = None) -> str:
     """
     Generate an end-of-session summary.
 
@@ -605,6 +904,7 @@ async def _generate_report(session: dict,
     Tries the Gemini LLM path first; falls back to the deterministic template.
     """
     history: List[Tuple] = session["history"]
+    context = report_context or _normalise_report_context(session.get("report_context"))
 
     if not history:
         return "No emotion data was captured during this session."
@@ -628,14 +928,21 @@ async def _generate_report(session: dict,
     if api_key:
         try:
             llm_text = await _llm_report(
-                history, emotion_pct, duration, api_key, transcript
+                history, emotion_pct, duration, api_key, transcript, context
             )
             if llm_text:
                 return llm_text
         except Exception as exc:
             print(f"[report] LLM call failed ({exc}). Falling back to template.")
 
-    return _template_report(duration, sorted_emotions, dominant_overall, history, transcript)
+    return _template_report(
+        duration,
+        sorted_emotions,
+        dominant_overall,
+        history,
+        transcript,
+        context,
+    )
 
 
 async def _llm_report(
@@ -644,6 +951,7 @@ async def _llm_report(
     duration:    float,
     api_key:     str,
     transcript:  Optional[str] = None,
+    report_context: Optional[Dict[str, str]] = None,
 ) -> Optional[str]:
     """
     Call Google Gemini to generate a natural-language session report.
@@ -683,16 +991,28 @@ async def _llm_report(
         if transcript else ""
     )
 
+    context = report_context or _normalise_report_context(None)
+    context_block = (
+        f"\n\nReport lens: {context['label']}\n"
+        f"Primary objective: {context['objective']}\n"
+        f"Lens guidance: {context['focus_prompt']}\n"
+        f"Safety note: {context['safety_note']}"
+    )
+    if context.get("extra_notes"):
+        context_block += f"\nAdditional analyst notes: {context['extra_notes']}"
+
     prompt = (
         f"You are analysing facial emotion recognition data captured from a video session.\n\n"
         f"Session duration  : {duration:.0f} seconds\n"
         f"Frames analysed   : {n}\n\n"
         f"Emotion distribution (% of frames where each emotion was dominant):\n{dist_block}\n\n"
         f"Emotional timeline (sampled every ~{step} frames):\n{timeline}"
-        f"{transcript_block}\n\n"
-        "Write a concise 2–3 paragraph report describing the person's emotional journey "
-        "through this session. Describe what emotions were dominant, any notable shifts or "
-        "transitions, and an overall characterisation of the emotional state."
+        f"{transcript_block}"
+        f"{context_block}\n\n"
+        "Write a detailed 4-part report with markdown bold section headers in this order: "
+        "**Emotional Arc**, **Context-Specific Interpretation**, **Actionable Guidance**, and "
+        "**Caution & Boundaries**.\n"
+        "Make each section specific to this session data and the selected report lens. "
         + (
             " Where relevant, connect the facial expressions to what was said in the transcript."
             if transcript else ""
@@ -718,6 +1038,7 @@ def _template_report(
     dominant_overall: str,
     history:          List[Tuple],
     transcript:       Optional[str] = None,
+    report_context:   Optional[Dict[str, str]] = None,
 ) -> str:
     """
     Build a readable, data-driven report without any external API call.
@@ -726,9 +1047,11 @@ def _template_report(
     top    = sorted_emotions[0]   # (emotion, %)
     second = next((e for e in sorted_emotions[1:] if e[1] > 5.0),  None)
     third  = next((e for e in sorted_emotions[2:] if e[1] > 3.0),  None)
+    context = report_context or _normalise_report_context(None)
 
     # ── Paragraph 1: overview ─────────────────────────────────────────────────
     p1 = (
+        "**Emotional Arc**\n"
         f"Throughout the {duration:.0f}-second session, your facial expressions were analysed "
         f"across {len(history)} video frames. "
         f"Your predominant emotion was **{top[0]}**, detected in {top[1]}% of the frames."
@@ -750,20 +1073,37 @@ def _template_report(
 
     if first_dom != second_dom:
         p2 = (
+            "**Context-Specific Interpretation**\n"
             f"Notably, the session showed an emotional shift: the first half was dominated by "
             f"**{first_dom}**, while the second half transitioned toward **{second_dom}**. "
-            "Such transitions are common as people naturally relax or react to evolving content "
-            "during a session."
+            f"For the selected lens (**{context['label']}**), this suggests: {context['template_hint']}"
         )
     else:
         p2 = (
+            "**Context-Specific Interpretation**\n"
             f"Your emotional state remained consistently **{first_dom}** throughout the session, "
-            "suggesting a clear and stable emotional baseline. This kind of consistency is typical "
-            "when someone is focused, engaged, or simply at ease during the recording."
+            f"suggesting a stable baseline. For the selected lens (**{context['label']}**), "
+            f"this supports: {context['template_hint']}"
         )
 
-    # ── Paragraph 3: system note ──────────────────────────────────────────────
+    switches = sum(
+        1 for idx in range(1, len(history)) if history[idx][1] != history[idx - 1][1]
+    )
+    stability = 100.0 if len(history) <= 1 else round((1 - switches / (len(history) - 1)) * 100, 1)
+
     p3 = (
+        "**Actionable Guidance**\n"
+        f"Objective: {context['objective']}. Emotional stability for this session was approximately "
+        f"{stability}% based on dominant-emotion transitions. "
+        f"Use this as a baseline and compare future runs for trend direction rather than one-off judgment."
+    )
+    if context.get("extra_notes"):
+        p3 += f" Additional notes considered: {context['extra_notes']}."
+
+    # ── Paragraph 3: system note ──────────────────────────────────────────────
+    p4 = (
+        "**Caution & Boundaries**\n"
+        f"{context['safety_note']} "
         "The analysis above was produced by processing each video frame through a deep learning "
         "facial emotion recognition model, using a 3-second (15-frame) sliding window to smooth "
         "out brief interruptions such as blinks or head turns. The live chart shows the full "
@@ -771,15 +1111,54 @@ def _template_report(
         "fear, happy, neutral, sad, and surprise — across the entire duration of your session."
     )
 
-    paragraphs = [p1, p2]
+    paragraphs = [p1, p2, p3]
     if transcript:
         p_transcript = (
             f"**What you said:** \"{transcript}\"\n\n"
             "Your spoken words provide additional context for the facial expressions observed above."
         )
         paragraphs.append(p_transcript)
-    paragraphs.append(p3)
+    paragraphs.append(p4)
     return "\n\n".join(paragraphs)
+
+
+@app.get("/analysis/{analysis_id}")
+async def get_analysis_by_id(analysis_id: str, request: Request) -> dict:
+    """Fetch one persisted analysis report for the authenticated user."""
+    user = _extract_user_from_request(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if ANALYSIS_COLLECTION is None:
+        raise HTTPException(status_code=503, detail="Analysis storage unavailable")
+
+    try:
+        object_id = ObjectId(analysis_id)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid analysis id") from exc
+
+    doc = ANALYSIS_COLLECTION.find_one({"_id": object_id, "user_id": user["id"]})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Analysis not found")
+    return _serialise_analysis_doc(doc)
+
+
+@app.get("/analysis/by-session/{session_id}")
+async def get_analysis_by_session(session_id: str, request: Request, backend: Optional[str] = None) -> dict:
+    """Fetch the latest persisted analysis for a session and authenticated user."""
+    user = _extract_user_from_request(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if ANALYSIS_COLLECTION is None:
+        raise HTTPException(status_code=503, detail="Analysis storage unavailable")
+
+    query: Dict[str, Any] = {"session_id": session_id, "user_id": user["id"]}
+    if backend:
+        query["backend"] = backend
+
+    doc = ANALYSIS_COLLECTION.find_one(query, sort=[("ended_at", -1)])
+    if not doc:
+        raise HTTPException(status_code=404, detail="Analysis not ready")
+    return _serialise_analysis_doc(doc)
 
 
 @app.get("/health")
@@ -790,6 +1169,7 @@ async def health() -> dict:
         "device":              str(DEVICE),
         "classes":             CLASS_NAMES,
         "window_size":         WINDOW_SIZE,
+        "analysis_storage":    ANALYSIS_COLLECTION is not None,
         "audio_transcription": WHISPER_MODEL is not None,
         "whisper_model":       os.getenv("WHISPER_MODEL", "base") if WHISPER_MODEL else None,
     }
