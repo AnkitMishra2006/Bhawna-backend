@@ -94,8 +94,8 @@ from model import EmotionNet
 # ── Load environment variables from optional .env file ──────────────────────
 load_dotenv(os.path.join(HERE, ".env"))
 
-# ── Authentication (Google OAuth + JWT + SQLite) ────────────────────────────
-from auth import auth_router, init_db, verify_token
+# ── Authentication (Google OAuth + JWT + MongoDB) ───────────────────────────
+from auth import auth_router, get_user_from_token, init_db
 
 # ── Globals loaded once at startup ──────────────────────────────────────────
 DEVICE: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -456,8 +456,8 @@ def _transcribe_audio(audio_chunks: List[bytes]) -> Optional[str]:
 async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
     # ── Authenticate via query-string token ────────────────────────────────
     token = websocket.query_params.get("token")
-    user_payload = verify_token(token) if token else None
-    if not user_payload:
+    user = get_user_from_token(token) if token else None
+    if not user:
         await websocket.accept()
         await websocket.send_text(json.dumps({
             "type": "auth_error",

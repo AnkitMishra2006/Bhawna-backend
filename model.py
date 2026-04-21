@@ -1,5 +1,5 @@
 """
-EmotionNet — improved CNN for 7-class facial emotion recognition.
+Bhawna — improved CNN for 7-class facial emotion recognition.
 
 Architecture:
   • 4 conv blocks instead of 3           (deeper representation)
