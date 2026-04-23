@@ -1,0 +1,35 @@
+# ── Core web framework ───────────────────────────────────────────────────────
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+websockets>=12.0
+
+# ── Deep learning ────────────────────────────────────────────────────────────
+# CPU-only build is fine for inference; add --index-url for GPU if needed.
+torch>=2.0.0
+torchvision>=0.15.0
+
+# ── Vision / face detection ───────────────────────────────────────────────────
+# Use opencv-python-headless on servers (no GUI dependencies).
+mediapipe>=0.10.0
+opencv-python-headless>=4.8.0
+
+# ── Utilities ────────────────────────────────────────────────────────────────
+numpy>=1.24.0
+python-dotenv>=1.0.0
+scikit-learn>=1.3.0
+# ── Authentication (Google OAuth + JWT + email/password + MongoDB) ────────────
+PyJWT>=2.8.0
+httpx>=0.25.0
+bcrypt>=4.0.0
+pymongo[srv]>=4.6.0
+# ── LLM report generation (optional — server works without this) ──────────────
+# Google Gemini free tier — get your key at https://aistudio.google.com/apikey
+google-generativeai>=0.8.0
+
+# ── Audio transcription (optional — server works without this) ────────────────
+# openai-whisper provides local speech-to-text using OpenAI's Whisper model.
+# NOTE: ffmpeg must also be installed on the system (not via pip).
+#   Windows: winget install Gyan.FFmpeg   or   choco install ffmpeg
+#   Linux:   sudo apt install ffmpeg
+#   macOS:   brew install ffmpeg
+openai-whisper>=20231117
